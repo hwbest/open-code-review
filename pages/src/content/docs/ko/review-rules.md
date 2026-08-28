@@ -56,6 +56,66 @@ OCR은 **네 겹의 우선순위 사슬**로 규칙을 해석합니다. 파일 �
 - `rules` — `{path, rule}` 항목의 배열이며 **선언 순서대로** 평가합니다. 파일에
   처음 일치하는 `path`가 그 파일을 리뷰할 때 OCR이 모델에 보낼 프롬프트를 정합니다.
 
+### 여러 규칙 파일 병합하기 {#merging-multiple-rule-files}
+
+`rule` 필드는 문자열(인라인 텍스트나 단일 `.md` 파일 경로)도 되고, 여러 규칙 문서를
+하나의 텍스트로 병합하는 **문자열 배열**도 됩니다 — 예컨대 general + language + domain
+규칙을 쌓을 수 있습니다. 처음 일치한 패턴이 이기는 규칙은 그대로입니다: 이기는
+단일 항목이 여전히 적용되며, 다만 그 항목이 여러 파일을 실을 수 있을 뿐입니다.
+
+```json
+{
+  "rules": [
+    {
+      "path": "**/*.java",
+      "rule": ["rules/java.md", "rules/security.md", "rules/convention.md"],
+      "merge_system_rule": true
+    }
+  ]
+}
+```
+
+배열 요소에는 파일 경로와 인라인 텍스트를 섞어 쓸 수 있습니다:
+
+```json
+{
+  "rules": [
+    {
+      "path": "**/*.java",
+      "rule": ["rules/java.md", "extra: check exception handling"],
+      "merge_system_rule": true
+    }
+  ]
+}
+```
+
+병합 형식:
+
+- **단일 값**(문자열, 또는 요소가 하나인 배열) — 있는 그대로 출력되고 구분자는
+  없으며, 예전 동작과 바이트 단위로 같습니다.
+- **여러 파일** — 세그먼트는 빈 줄 + `---` + 빈 줄로 이어집니다. 병합된 규칙 텍스트는
+  내용만 들고, 파일별 제목은 없습니다 — 그래서 단일 값, 요소 하나짜리 배열, 여러 요소
+  배열이 모두 한결같습니다. 파일 출처 추적은 규칙 텍스트가 아니라 `ocr rules check`가
+  찍는 `Rule Files:` 줄(LLM 프롬프트에는 들어가지 않음)이 맡습니다.
+- 빠졌거나 빈 요소는 병합된 **규칙 텍스트**에서 빠집니다(경고와 함께). 요소가 전부
+  빠지면 그 항목은 시스템 규칙으로 넘어갑니다(단일 파일이 빠진 것과 같은 규칙). 빠진 **파일 경로**는
+  `Rule Files:` 줄에 적은 대로 남아 있어, 아무 기여도 하지 않은 오타 경로가 보이도록
+  합니다. 빈/공백만 있는 배열 요소(예: 명시적인 `""`나 `"  "`)도 빠지지만, `Rule Files:` 줄에는
+  아예 나오지 않습니다 — 파일도 인라인 텍스트도 아니기 때문입니다.
+
+> 배열 안의 파일 경로도 #1100의 경로 순회 제약을 그대로 받습니다: 프로젝트 계층의
+> 참조는 저장소 루트를 벗어날 수 없습니다.
+
+신뢰할 수 없는 배열이 I/O나 메모리를 부풀리지 못하게 두 가지 상한이 있습니다:
+
+- **개수** — 32개를 넘는 배열은 어떤 파일 읽기보다 먼저 처음 32개로 잘리고, 나머지는
+  경고와 함께 버립니다. 빈 요소도 32에 포함되므로, 빈 요소로 채우는 건 예산만 낭비합니다.
+- **크기** — 병합된 규칙 텍스트는 512 KB(524288 바이트)가 상한입니다. 어떤 입력이
+  합계를 상한 너머로 밀면 그 입력은 건너뛰고(뒤의 더 작은 입력은 여전히
+  들어갑니다) 경고가 납니다. 512 KB가 넘는 단일 파일은 경고와 함께 곧바로 거부되어
+  (빠진 파일처럼 병합에서 건너뜁니다) 더 이상 기여할 입력이 남지 않으면 그 항목은
+  시스템 규칙으로 넘어갑니다.
+
 ### glob 기능 {#glob-features}
 
 OCR은 [`bmatcuk/doublestar/v4`](https://pkg.go.dev/github.com/bmatcuk/doublestar/v4)로
@@ -213,14 +273,16 @@ $ ocr rules check --rule custom.json src/main/resources/mapper/UserMapper.xml
 File: src/main/resources/mapper/UserMapper.xml
 Source: Custom (--rule)
 Pattern: **/*mapper*.xml
+Rule Files: rules/java.md, rules/security.md, rules/convention.md
 Rule:
 ────────────────────────────────────────
-…contents of your custom rule…
+…contents of your merged rule…
 ────────────────────────────────────────
 ```
 
-규칙이 예상과 다르게 동작할 때마다 쓰세요. 어느 **계층**의 어떤 **패턴**이 이겼는지
-알려 줍니다.
+`Rule Files:` 줄은 일치한 규칙이 어느 파일에서 왔는지(인라인 텍스트는 `<inline>`으로
+보임) 나열하여, 병합된 내용을 추적 가능하게 합니다. 규칙이 기대와 다를 때마다 쓰세요 —
+어느 **계층**의 어떤 **패턴**이 이겼는지 알려 줍니다.
 
 ## 레시피 {#recipes}
 
@@ -264,6 +326,41 @@ ocr review --rule ./.review-rules-only-for-this-pr.json
 
 프로젝트 계층과 전역 계층을 모두 건너뜁니다. PR 하나에만 전혀 다른 리뷰
 체크리스트(예: 보안만 보는 리뷰)가 필요할 때 쓸 만합니다.
+
+### 프로젝트 수준: 언어 베이스와 관심사 규칙 쌓기 {#project-level-stack-language-and-concern-rules}
+
+모든 것을 한 파일에 우겨넣는 대신 여러 규칙 문서를 같은 경로에 쌓습니다. `path`마다
+언어 베이스 규칙에 관심사 규칙 — security, performance, convention — 을 원하는 대로
+조합해 붙입니다:
+
+```json
+{
+  "rules": [
+    {
+      "path": "**/*.java",
+      "rule": ["rules/java.md", "rules/security.md", "rules/convention.md"],
+      "merge_system_rule": true
+    },
+    {
+      "path": "**/*.c",
+      "rule": ["rules/cpp.md", "rules/security.md", "rules/performance.md"],
+      "merge_system_rule": true
+    },
+    {
+      "path": "**/*.kt",
+      "rule": ["rules/kotlin.md", "rules/security.md"],
+      "merge_system_rule": true
+    }
+  ]
+}
+```
+
+`rules/java.md`, `rules/cpp.md`, `rules/kotlin.md`가 `path`마다
+언어 전용 베이스 규칙을 맡고, `rules/security.md`,
+`rules/performance.md`, `rules/convention.md`는 필요에 따라
+조합하는 재사용 가능한 관심사 규칙입니다. `ocr rules check`가
+`Rule Files:` 줄을 찍어 주어, 실제로 어떤 조합이
+적용됐는지 확인할 수 있습니다.
 
 ### 개인 전역 설정 {#global-personal-preferences}
 

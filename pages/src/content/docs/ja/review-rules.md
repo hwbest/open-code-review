@@ -46,6 +46,49 @@ OCR は**4 層の優先順位チェーン**でルールを解決します。各�
 - `exclude`: 任意。OCR がレビューしないファイルの glob パターンです。フィルタリングで最も優先されます。
 - `rules`: `{path, rule}` エントリの配列で、**宣言順**に評価されます。そのファイルに最初に一致した `path` glob のエントリが、OCR がモデルに送る prompt を決定します。
 
+### 複数のルールファイルをマージする {#merging-multiple-rule-files}
+
+`rule` フィールドは文字列（インラインテキストまたは単一の `.md` ファイルパス）だけでなく、複数のルール文書を 1 つのテキストにマージする**文字列の配列**も受け付けます（例えば general + language + domain のルールを積み重ねられます）。first-match-wins は変更されません: 勝者となる単一のエントリが引き続き適用されるだけで、そのエントリが複数のファイルを担えるようになります。
+
+```json
+{
+  "rules": [
+    {
+      "path": "**/*.java",
+      "rule": ["rules/java.md", "rules/security.md", "rules/convention.md"],
+      "merge_system_rule": true
+    }
+  ]
+}
+```
+
+配列要素にはファイルパスとインラインテキストを混在させられます:
+
+```json
+{
+  "rules": [
+    {
+      "path": "**/*.java",
+      "rule": ["rules/java.md", "extra: check exception handling"],
+      "merge_system_rule": true
+    }
+  ]
+}
+```
+
+マージ形式:
+
+- **単一値**（文字列、または要素 1 つの配列）: そのまま出力され、セパレータは付かず、従来の動作とバイト単位で同一です。
+- **複数ファイル**: 各セグメントは空行 + `---` + 空行で結合されます。マージされたルールテキストは純粋な内容のみで、ファイルごとの見出しは付きません。そのため、単一値、要素 1 つの配列、複数要素の配列の各ケースが統一されます。ファイル由来の追跡は、ルールテキストではなく `ocr rules check` が出力する `Rule Files:` 行（LLM prompt には入りません）が担います。
+- 欠落または空の要素はマージされた**ルールテキスト**から除外されます（警告付き）。すべての要素が除外された場合はそのエントリはシステムルールにフォールバックします（単一ファイルの欠落と同じセマンティクス）。除外された**ファイルパス**は `Rule Files:` 行に書いた通りに残ります。何も貢献しないタイプミスのパスが見えるままになります。空/空白のみの配列要素（明示的な `""` や `"  "` など）も除外されますが、`Rule Files:` 行には一切現れません。ファイルでもインラインテキストでもないからです。
+
+> 配列内のファイルパスは #1100 のパストラバーサル制約のまま縛られます: プロジェクト層の参照はリポジトリルートから逃げられません。
+
+2 つの上限が、信頼できない配列が I/O やメモリを膨張させないよう制限します:
+
+- **個数**: 32 要素を超える配列は、いかなるファイル読み取りよりも前に最初の 32 要素へ切り詰められ、残りは警告付きで切り捨てられます。空要素もこの 32 に数えられるため、パディングは予算を浪費するだけです。
+- **サイズ**: マージされたルールテキストは 512 KB（524288 バイト）が上限です。ある入力が合計を上限より超過させる場合、その入力はスキップされ（後のより小さな入力はまだ収まります）警告を出します。512 KB を超える単一ファイルは警告付きでそのまま拒否され（欠落ファイルと同様にマージからスキップされます）。その結果、貢献する入力が残っていなければ、エントリはシステムルールにフォールバックします。
+
 ### glob の機能
 
 OCR は [`bmatcuk/doublestar/v4`](https://pkg.go.dev/github.com/bmatcuk/doublestar/v4) でマッチングを行います:
@@ -185,13 +228,14 @@ $ ocr rules check --rule custom.json src/main/resources/mapper/UserMapper.xml
 File: src/main/resources/mapper/UserMapper.xml
 Source: Custom (--rule)
 Pattern: **/*mapper*.xml
+Rule Files: rules/java.md, rules/security.md, rules/convention.md
 Rule:
 ────────────────────────────────────────
-…contents of your custom rule…
+…contents of your merged rule…
 ────────────────────────────────────────
 ```
 
-あるルールが期待どおりに有効にならないときに使用してください。有効な**層**と**パターン**を表示します。
+`Rule Files:` 行は、一致したルールがどのファイルから来たかを列挙し（インラインテキストは `<inline>` と表示）、マージされた内容を追跡可能にします。ルールが期待どおりに動かないときはいつでも使ってください。勝者となった**層**と**パターン**を教えてくれます。
 
 ## レシピ
 
@@ -232,6 +276,34 @@ ocr review --rule ./.review-rules-only-for-this-pr.json
 ```
 
 プロジェクト層とグローバル層の両方を同時にバイパスします。単一の PR が完全に異なるレビューチェックリスト（例: セキュリティレビューのみ）を必要とするときに便利です。
+
+### プロジェクトレベル: 言語ベースと懸心事項のルールを積み重ねる {#project-level-stack-language-and-concern-rules}
+
+すべてを 1 つのファイルに詰め込む代わりに、複数のルール文書を同じパスに積み重ねます。`path` ごとに、言語ベースのルールと懸心事項ルール（security、performance、convention）の任意の組合せを合わせます:
+
+```json
+{
+  "rules": [
+    {
+      "path": "**/*.java",
+      "rule": ["rules/java.md", "rules/security.md", "rules/convention.md"],
+      "merge_system_rule": true
+    },
+    {
+      "path": "**/*.c",
+      "rule": ["rules/cpp.md", "rules/security.md", "rules/performance.md"],
+      "merge_system_rule": true
+    },
+    {
+      "path": "**/*.kt",
+      "rule": ["rules/kotlin.md", "rules/security.md"],
+      "merge_system_rule": true
+    }
+  ]
+}
+```
+
+`rules/java.md`、`rules/cpp.md`、`rules/kotlin.md` が言語固有のベースルールを `path` ごとに保持し、`rules/security.md`、`rules/performance.md`、`rules/convention.md` は必要に応じて組み合わせる再利用可能な懸心事項ルールです。`ocr rules check` が `Rule Files:` 行を出力するので、実際に適用された組合せを確認できます。
 
 ### グローバルな個人設定
 
